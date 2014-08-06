@@ -112,7 +112,7 @@ def main():
     try:
         while oplog.alive:
             try:
-                op = oplog.next()
+                op = next(oplog)
             except StopIteration:
                 if not args.follow:
                     logging.info("all done")
@@ -148,7 +148,7 @@ def main():
                 continue
 
             # Rename namespaces
-            for old_ns, new_ns in rename.iteritems():
+            for old_ns, new_ns in rename.items():
                 if old_ns.match(op['ns']):
                     ns = old_ns.sub(new_ns, op['ns']).rstrip(".")
                     logging.debug("renaming %s to %s", op['ns'], ns)
