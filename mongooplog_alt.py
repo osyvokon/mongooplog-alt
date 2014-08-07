@@ -13,8 +13,6 @@
 # limitations under the License.
 
 import argparse
-import calendar
-import datetime
 import time
 import json
 import logging
@@ -22,7 +20,7 @@ import pymongo
 import bson
 import re
 
-def parse_args():
+def parse_args(*args, **kwargs):
     parser = argparse.ArgumentParser(add_help=False)
 
     parser.add_argument("--help",
@@ -31,6 +29,9 @@ def parse_args():
 
     parser.add_argument("--from", metavar="host[:port]", dest="fromhost",
                         help="host to pull from")
+
+    parser.add_argument('--oplogns', default='local.oplog.rs',
+                        help="source namespace for oplog")
 
     parser.add_argument("-h", "--host", "--to", metavar="host[:port]",
                         default="localhost",
@@ -56,6 +57,7 @@ def parse_args():
 
     parser.add_argument("--rename", nargs="*", default=[],
                         metavar="ns_old=ns_new",
+                        type=rename_item,
                         help="rename namespaces before processing on dest")
 
     parser.add_argument("--resume-file", default="mongooplog.ts",
@@ -66,27 +68,54 @@ def parse_args():
                              Pass empty string or 'none' to disable this
                              feature.
                              """)
+    parser.add_argument('-l', '--log-level', default=logging.INFO,
+        type=log_level, help="Set log level (DEBUG, INFO, WARNING, ERROR)")
 
-    return parser.parse_args()
+    args = parser.parse_args(*args, **kwargs)
+    args.rename = dict(args.rename)
+    return args
+
+def log_level(level_string):
+    """
+    Return a log level for a string
+    """
+    return getattr(logging, level_string.upper())
+
+def rename_item(spec):
+    """
+    Return a pair of old namespace (regex) to the new namespace (string).
+
+    spec should be a pair separated by equal sign ('=').
+    """
+    old_ns, new_ns = spec.split('=')
+    regex = re.compile(r"^{0}(\.|$)".format(re.escape(old_ns)))
+
+    return regex, new_ns + "."
+
+def _calculate_start(args):
+    """
+    Return the start time as a bson timestamp.
+    """
+    utcnow = int(time.time())
+
+    if args.seconds:
+        return bson.timestamp.Timestamp(utcnow - args.seconds, 0)
+
+    day_ago = bson.timestamp.Timestamp(utcnow - 24*60*60, 0)
+    return read_ts(args.resume_file) or day_ago
 
 def main():
     args = parse_args()
-    setup_logging()
-
-    rename = {}     # maps old namespace (regex) to the new namespace (string)
-    for rename_pair in args.rename:
-        old_ns, new_ns = rename_pair.split("=")
-        old_ns_re = re.compile(r"^{0}(\.|$)".format(re.escape(old_ns)))
-        rename[old_ns_re] = new_ns + "."
+    log_format = '%(asctime)s - %(levelname)s - %(message)s'
+    logging.basicConfig(level=args.log_level, format=log_format)
 
     logging.info("going to connect")
 
-    src = pymongo.Connection(args.fromhost)
-    dest = pymongo.Connection(args.host, args.port)
+    src = pymongo.MongoClient(args.fromhost)
+    dest = pymongo.MongoClient(args.host, args.port)
 
     if src == dest:
-        rename_ns = {x.split("=")[0] for x in args.rename}
-        if any(ns not in rename_ns for ns in args.ns) or not args.ns:
+        if any(not any(exp.match(ns) for exp in args.rename) for ns in args.ns) or not args.ns:
             logging.error(
                 "source and destination hosts can be the same only "
                 "when both --ns and --rename arguments are given")
@@ -94,89 +123,108 @@ def main():
 
     logging.info("connected")
 
-    # Find out where to start from
-    utcnow = calendar.timegm(time.gmtime())
-    if args.seconds:
-        start = bson.timestamp.Timestamp(utcnow - args.seconds, 0)
-    else:
-        day_ago = bson.timestamp.Timestamp(utcnow - 24*60*60, 0)
-        start = read_ts(args.resume_file) or day_ago
+    start = _calculate_start(args)
 
     logging.info("starting from %s", start)
-    q = {"ts": {"$gte": start}}
-    oplog = (src.local['oplog.rs'].find(q, tailable=True, await_data=True)
-                                  .sort("$natural", pymongo.ASCENDING))
+    db_name, sep, coll_name = args.oplogns.partition('.')
+    oplog_coll = src[db_name][coll_name]
     num = 0
-    ts = start
+
+    class_ = TailingOplog if args.follow else Oplog
+    generator = class_(oplog_coll)
 
     try:
-        while oplog.alive:
-            try:
-                op = oplog.next()
-            except StopIteration:
-                if not args.follow:
-                    logging.info("all done")
-                    return
-                else:
-                    logging.debug("waiting for new data...")
-                    time.sleep(1)
-                    continue
-            except bson.errors.InvalidDocument as e:
-                logging.info(repr(e))
-                continue
-
-            # Skip "no operation" items
-            if op['op'] == 'n':
-                continue
-
-            # Update status
-            ts = op['ts']
-            if not num % 1000:
-                save_ts(ts, args.resume_file)
-                logging.info("%s\t%s\t%s -> %s",
-                             num, ts.as_datetime(),
-                             op.get('op'),
-                             op.get('ns'))
-            num += 1
-
-            # Skip excluded namespaces or namespaces that does not match --ns
-            excluded = any(op['ns'].startswith(ns) for ns in args.exclude)
-            included = any(op['ns'].startswith(ns) for ns in args.ns)
-
-            if excluded or (args.ns and not included):
-                logging.debug("skipping ns %s", op['ns'])
-                continue
-
-            # Rename namespaces
-            for old_ns, new_ns in rename.iteritems():
-                if old_ns.match(op['ns']):
-                    ns = old_ns.sub(new_ns, op['ns']).rstrip(".")
-                    logging.debug("renaming %s to %s", op['ns'], ns)
-                    op['ns'] = ns
-
-            # Apply operation
-            try:
-                dbname = op['ns'].split('.')[0] or "admin"
-                dest[dbname].command("applyOps", [op])
-            except pymongo.errors.OperationFailure as e:
-                logging.warning(repr(e))
-
+        for num, doc in enumerate(generator.since(start)):
+            _handle(dest, doc, args, num)
+        logging.info("all done")
     except KeyboardInterrupt:
         logging.info("Got Ctrl+C, exiting...")
-
     finally:
+        if 'doc' in locals():
+            save_ts(doc['ts'], args.resume_file)
+
+def _handle(dest, op, args, num):
+    # Skip "no operation" items
+    if op['op'] == 'n':
+        return
+
+    # Update status
+    ts = op['ts']
+    if not num % 1000:
         save_ts(ts, args.resume_file)
+        logging.info("%s\t%s\t%s -> %s",
+                     num, ts.as_datetime(),
+                     op.get('op'),
+                     op.get('ns'))
 
-def setup_logging():
-    logger = logging.getLogger()
-    logger.setLevel(logging.INFO)
+    # Skip excluded namespaces or namespaces that does not match --ns
+    excluded = any(op['ns'].startswith(ns) for ns in args.exclude)
+    included = any(op['ns'].startswith(ns) for ns in args.ns)
 
-    formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+    if excluded or (args.ns and not included):
+        logging.debug("skipping ns %s", op['ns'])
+        return
 
-    ch = logging.StreamHandler()
-    ch.setLevel(logging.INFO)
-    ch.setFormatter(formatter)
-    logger.addHandler(ch)
+    # Rename namespaces
+    for old_ns, new_ns in args.rename.items():
+        if old_ns.match(op['ns']):
+            ns = old_ns.sub(new_ns, op['ns']).rstrip(".")
+            logging.debug("renaming %s to %s", op['ns'], ns)
+            op['ns'] = ns
+
+    # Apply operation
+    try:
+        dbname = op['ns'].split('.')[0] or "admin"
+        dest[dbname].command("applyOps", [op])
+    except pymongo.errors.OperationFailure as e:
+        logging.warning(repr(e))
+
+class Oplog(object):
+    def __init__(self, coll):
+        self.coll = coll
+
+    def get_latest_ts(self):
+        cur = self.coll.find().sort('$natural', pymongo.DESCENDING).limit(-1)
+        latest_doc = next(cur)
+        return latest_doc['ts']
+
+    def query(self, spec):
+        return self.coll.find(spec)
+
+    def since(self, ts):
+        """
+        Query the oplog for items since ts and then return
+        """
+        spec = {'ts': {'$gt': ts}}
+        cursor = self.query(spec)
+        while True:
+            # todo: trap InvalidDocument errors:
+            # except bson.errors.InvalidDocument as e:
+            #  logging.info(repr(e))
+            for doc in cursor:
+                yield doc
+            if not cursor.alive:
+                break
+            time.sleep(1)
+
+
+class TailingOplog(Oplog):
+    def query(self, spec):
+        cur = self.coll.find(spec, tailable=True, await_data=True)
+        # set the oplogReplay flag - not exposed in the public API
+        cur.add_option(8)
+        return cur
+
+    def since(self, ts):
+        """
+        Tail the oplog, starting from ts.
+        """
+        while True:
+            items = super(TailingOplog, self).since(ts)
+            for doc in items:
+                yield doc
+                ts = doc['ts']
+
 
 def save_ts(ts, filename):
     """Save last processed timestamp to file. """
